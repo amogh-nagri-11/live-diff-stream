@@ -198,3 +198,35 @@ export async function closeWatchSession(session: WatchSession): Promise<void> {
   session.subscribers.clear();
   session.fileSnapshots.clear();
 }
+
+/** In-memory registry of active sessions, keyed by id. */
+const registry = new Map<string, WatchSession>();
+
+/** Look up an active session by id. */
+export function getSession(id: string): WatchSession | undefined {
+  return registry.get(id);
+}
+
+/** All currently active sessions. */
+export function listSessions(): WatchSession[] {
+  return [...registry.values()];
+}
+
+/** Create a watch session and register it as active. */
+export async function startSession(
+  rootPath: string,
+  broadcast: BroadcastFn,
+): Promise<WatchSession> {
+  const session = await createWatchSession(rootPath, broadcast);
+  registry.set(session.id, session);
+  return session;
+}
+
+/** Stop and deregister a session. Returns false if no such session existed. */
+export async function stopSession(id: string): Promise<boolean> {
+  const session = registry.get(id);
+  if (!session) return false;
+  await closeWatchSession(session);
+  registry.delete(id);
+  return true;
+}
