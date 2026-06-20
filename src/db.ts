@@ -1,9 +1,24 @@
+import { mkdirSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import Database from "better-sqlite3";
 import type { Database as DatabaseType } from "better-sqlite3";
 import type { DiffEntry, DiffEventType } from "./types.js";
 
-/** Path to the SQLite file; overridable for tests via env. */
-const DB_PATH = process.env.LDS_DB_PATH ?? "diffs.db";
+/**
+ * Path to the SQLite file; overridable for tests via env.
+ *
+ * The default lives in an OS temp directory rather than the current working
+ * directory on purpose: the db (and its `-wal`/`-shm` sidecars) is a server
+ * artifact, and if it sat inside a directory being watched it would trigger
+ * diffs of its own writes — a self-amplifying feedback loop. Keeping it outside
+ * any watchable tree avoids that entirely.
+ */
+const DB_PATH =
+  process.env.LDS_DB_PATH ?? path.join(os.tmpdir(), "live-diff-stream", "diffs.db");
+
+mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
 export const db: DatabaseType = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");

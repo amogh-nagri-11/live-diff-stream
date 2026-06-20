@@ -12,17 +12,22 @@
   },
   "license": "MIT",
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "better-sqlite3": "^11.8.1",
     "chokidar": "^4.0.3",
     "diff": "^7.0.0",
+    "dotenv": "^17.4.2",
     "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.3",
     "simple-git": "^3.27.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
     "@types/better-sqlite3": "^7.6.12",
     "@types/diff": "^7.0.0",
     "@types/express": "^5.0.0",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.10.7",
     "@types/ws": "^8.5.13",
     "tsx": "^4.19.2",

@@ -40,6 +40,14 @@ export interface WatchSession {
   subscribers: Set<WebSocket>;
   /** filepath -> last-known file contents, keyed by absolute path. */
   fileSnapshots: Map<string, string>;
+  /**
+   * If the session watches a repository we cloned ourselves, the temp
+   * directory to delete when the session is torn down. Undefined for sessions
+   * watching a pre-existing local directory the user supplied.
+   */
+  cloneDir?: string;
+  /** The original source the user supplied (local path or git URL). */
+  source: string;
 }
 
 /** Messages a client may send to the server over the WebSocket. */

@@ -1,8 +1,13 @@
+// Load .env before any other import, since db/auth/oauth read process.env at
+// import time. Keep this first.
+import "dotenv/config";
+
 import http from "node:http";
 
 import { WebSocketServer } from "ws";
 
 import { app } from "./index.js";
+import { verifyToken } from "./auth.js";
 import { db, purgeDiffs } from "./db.js";
 import { getSession, listSessions, stopSession } from "./sessions.js";
 
@@ -14,21 +19,30 @@ const MAX_DIFF_AGE_MS = 24 * 60 * 60 * 1000; // 24h
 
 const server = http.createServer(app);
 
-/** Extract the `session` query param from an upgrade/connection request. */
-function sessionIdFromRequest(req: { url?: string; headers: { host?: string } }) {
+/** Extract a named query param from an upgrade/connection request. */
+function queryParam(
+  req: { url?: string; headers: { host?: string } },
+  name: string,
+): string | null {
   const url = new URL(req.url ?? "", `http://${req.headers.host}`);
-  return url.searchParams.get("session");
+  return url.searchParams.get(name);
 }
 
-// Live diff stream. Clients connect to /ws?session=<id> and receive each
-// recorded diff as JSON. The session is validated during the HTTP upgrade
-// handshake, so an unknown/missing session is rejected with a 4xx before any
-// WebSocket is established.
+// Live diff stream. Clients connect to /ws?session=<id>&token=<jwt> and receive
+// each recorded diff as JSON. Both the JWT and the session are validated during
+// the HTTP upgrade handshake, so an unauthenticated or unknown request is
+// rejected with a 4xx before any WebSocket is established. (Browsers can't set
+// headers on a WebSocket, so the token travels as a query param.)
 const wss = new WebSocketServer({
   server,
   path: "/ws",
   verifyClient: (info, done) => {
-    const sessionId = sessionIdFromRequest(info.req);
+    const token = queryParam(info.req, "token");
+    if (!token || !verifyToken(token)) {
+      done(false, 401, "missing or invalid token");
+      return;
+    }
+    const sessionId = queryParam(info.req, "session");
     if (!sessionId) {
       done(false, 400, "missing 'session' query param");
       return;
@@ -44,7 +58,7 @@ const wss = new WebSocketServer({
 wss.on("connection", (socket, req) => {
   // verifyClient already guaranteed the session exists; re-resolve it here and
   // bail gracefully on the rare chance it was deleted mid-handshake.
-  const sessionId = sessionIdFromRequest(req);
+  const sessionId = queryParam(req, "session");
   const session = sessionId ? getSession(sessionId) : undefined;
   if (!session) {
     socket.close(1008, "session no longer exists");

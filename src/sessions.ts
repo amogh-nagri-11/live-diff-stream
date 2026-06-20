@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
 import chokidar from "chokidar";
@@ -20,20 +21,118 @@ export type BroadcastFn = (sessionId: string, entry: DiffEntry) => void;
 const IGNORED_DIRS = new Set(["node_modules", "dist", ".git"]);
 
 /**
+ * Filenames that are never watched. SQLite databases (and their `-wal`/`-shm`
+ * sidecars) are binary server artifacts; diffing them as text produces huge,
+ * meaningless patches and — when the db lives inside the watched tree — a
+ * self-amplifying feedback loop as the server's own writes trigger more diffs.
+ */
+const IGNORED_FILE_RE = /\.(db|sqlite|sqlite3)(-wal|-shm|-journal)?$/i;
+
+/**
  * Whether `absPath` should be excluded from watching. Any path segment
  * (relative to the watch root) that is a dotfile/dotdir or one of
- * {@link IGNORED_DIRS} is ignored. The root itself is never excluded, so a
- * root that happens to live under a hidden directory still works.
+ * {@link IGNORED_DIRS} is ignored, as is any file matching
+ * {@link IGNORED_FILE_RE}. The root itself is never excluded, so a root that
+ * happens to live under a hidden directory still works.
  */
 function isIgnored(rootPath: string, absPath: string): boolean {
   const rel = path.relative(rootPath, absPath);
   if (rel === "") return false;
+  if (IGNORED_FILE_RE.test(path.basename(absPath))) return true;
   for (const segment of rel.split(path.sep)) {
     if (segment === "" || segment === ".") continue;
     if (segment.startsWith(".")) return true;
     if (IGNORED_DIRS.has(segment)) return true;
   }
   return false;
+}
+
+/**
+ * Recognise the input as a remote git URL we should clone rather than a local
+ * directory path. Covers `https://`, `http://`, `git://`, `ssh://`, and the
+ * scp-style `git@host:owner/repo` form that GitHub offers for SSH.
+ */
+export function isGitUrl(input: string): boolean {
+  const s = input.trim();
+  return (
+    /^(https?|git|ssh):\/\//i.test(s) ||
+    /^[^/\s]+@[^/\s]+:.+/.test(s) // scp-style: user@host:path
+  );
+}
+
+/**
+ * Clone `url` (shallow, default branch) into a fresh temp directory and return
+ * its path. The caller owns the directory and must delete it when done — this
+ * is recorded as the session's {@link WatchSession.cloneDir}.
+ */
+export async function cloneRepo(url: string): Promise<string> {
+  const dir = await mkdtemp(path.join(tmpdir(), "live-diff-clone-"));
+  try {
+    await simpleGit().clone(url, dir, ["--depth", "1"]);
+    return dir;
+  } catch (err) {
+    // Don't leak the temp dir if the clone failed partway through.
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    throw err;
+  }
+}
+
+/** A node in the watched directory's file tree. */
+export interface TreeNode {
+  name: string;
+  /** Path relative to the watch root, POSIX-style (`/` separators). */
+  path: string;
+  type: "file" | "dir";
+  /** Present for directories; the sorted child nodes. */
+  children?: TreeNode[];
+}
+
+/**
+ * Recursively read `rootPath` into a tree, applying the same ignore rules as
+ * the watcher (dotfiles, `node_modules`, `dist`, `.git`, db sidecars). Within
+ * each directory, sub-directories sort before files, both alphabetically.
+ */
+export async function readTree(rootPath: string): Promise<TreeNode[]> {
+  async function walk(dir: string): Promise<TreeNode[]> {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    const nodes: TreeNode[] = [];
+    for (const e of entries) {
+      const abs = path.join(dir, e.name);
+      if (isIgnored(rootPath, abs)) continue;
+      const rel = path.relative(rootPath, abs).split(path.sep).join("/");
+      if (e.isDirectory()) {
+        nodes.push({ name: e.name, path: rel, type: "dir", children: await walk(abs) });
+      } else if (e.isFile()) {
+        nodes.push({ name: e.name, path: rel, type: "file" });
+      }
+    }
+    nodes.sort((a, b) =>
+      a.type === b.type
+        ? a.name.localeCompare(b.name)
+        : a.type === "dir"
+          ? -1
+          : 1,
+    );
+    return nodes;
+  }
+  return walk(rootPath);
+}
+
+/**
+ * Resolve `relPath` against `rootPath`, returning the absolute path only if it
+ * stays inside the root. Returns null on any attempt to escape (`..`, absolute
+ * paths, symlink-style tricks via `path.relative`).
+ */
+export function resolveInRoot(rootPath: string, relPath: string): string | null {
+  const abs = path.resolve(rootPath, relPath);
+  const rel = path.relative(rootPath, abs);
+  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+  return abs;
 }
 
 /** Read a file, treating any failure (e.g. it vanished) as empty content. */
@@ -58,6 +157,14 @@ async function isGitTracked(
     return false;
   }
 }
+
+/**
+ * Largest patch (in bytes) we'll stream. A single oversized diff — e.g. a
+ * generated bundle or an accidentally-watched binary — would otherwise exceed
+ * the WebSocket max-payload limit and tear down the whole client connection.
+ * Past this size we replace the patch with a short placeholder instead.
+ */
+const MAX_PATCH_BYTES = 1024 * 1024; // 1 MiB
 
 /** Count added/removed lines in a unified-diff patch, ignoring its headers. */
 function countLines(patch: string): { added: number; removed: number } {
@@ -106,6 +213,16 @@ async function computeDiff(
   else session.fileSnapshots.set(absPath, current);
 
   const { added, removed } = countLines(patch);
+
+  // Guard against a single huge diff blowing past the WebSocket payload limit
+  // and dropping the client. Report the change without the full body.
+  if (Buffer.byteLength(patch, "utf8") > MAX_PATCH_BYTES) {
+    patch =
+      `Index: ${relPath}\n` +
+      `=================================================================` +
+      `\n# diff omitted: patch exceeds ${MAX_PATCH_BYTES} bytes ` +
+      `(+${added} -${removed} lines)\n`;
+  }
   return {
     id: randomUUID(),
     filepath: relPath,
@@ -154,6 +271,7 @@ async function handleEvent(
 export async function createWatchSession(
   rootPath: string,
   broadcast: BroadcastFn,
+  opts: { source?: string; cloneDir?: string } = {},
 ): Promise<WatchSession> {
   const absRoot = path.resolve(rootPath);
   const watcher = chokidar.watch(absRoot, {
@@ -175,6 +293,8 @@ export async function createWatchSession(
     git: simpleGit(absRoot),
     subscribers: new Set(),
     fileSnapshots: new Map(),
+    cloneDir: opts.cloneDir,
+    source: opts.source ?? absRoot,
   };
 
   const events: DiffEventType[] = ["add", "change", "unlink"];
@@ -197,6 +317,13 @@ export async function closeWatchSession(session: WatchSession): Promise<void> {
   await session.watcher.close();
   session.subscribers.clear();
   session.fileSnapshots.clear();
+  // If we cloned this repo ourselves, remove the temp checkout. Best-effort:
+  // a failure here shouldn't keep the session registered.
+  if (session.cloneDir) {
+    await rm(session.cloneDir, { recursive: true, force: true }).catch((err) => {
+      console.error(`[session ${session.id}] failed to remove clone dir:`, err);
+    });
+  }
 }
 
 /** In-memory registry of active sessions, keyed by id. */
@@ -216,8 +343,9 @@ export function listSessions(): WatchSession[] {
 export async function startSession(
   rootPath: string,
   broadcast: BroadcastFn,
+  opts: { source?: string; cloneDir?: string } = {},
 ): Promise<WatchSession> {
-  const session = await createWatchSession(rootPath, broadcast);
+  const session = await createWatchSession(rootPath, broadcast, opts);
   registry.set(session.id, session);
   return session;
 }
