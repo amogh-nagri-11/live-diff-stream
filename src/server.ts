@@ -9,7 +9,15 @@ import { WebSocketServer } from "ws";
 import { app } from "./index.js";
 import { verifyToken } from "./auth.js";
 import { db, purgeDiffs } from "./db.js";
-import { getSession, listSessions, stopSession } from "./sessions.js";
+import { getRoom, isMember } from "./rooms-store.js";
+import {
+  addSubscriber,
+  isLive,
+  removeSubscriber,
+  stopAllRoomWatches,
+  type ClientConn,
+} from "./rooms.js";
+import { findUserById } from "./users.js";
 
 const PORT = Number(process.env.PORT ?? 4400);
 
@@ -28,27 +36,34 @@ function queryParam(
   return url.searchParams.get(name);
 }
 
-// Live diff stream. Clients connect to /ws?session=<id>&token=<jwt> and receive
-// each recorded diff as JSON. Both the JWT and the session are validated during
-// the HTTP upgrade handshake, so an unauthenticated or unknown request is
-// rejected with a 4xx before any WebSocket is established. (Browsers can't set
-// headers on a WebSocket, so the token travels as a query param.)
+// Live room stream. Clients connect to /ws?room=<id>&token=<jwt> and receive
+// presence, diff, chat, and comment messages as JSON. The JWT, the room, and
+// the caller's membership are all validated during the HTTP upgrade handshake,
+// so a request from a non-member is rejected with a 4xx before any WebSocket is
+// established. (Browsers can't set headers on a WebSocket, so the token travels
+// as a query param.)
 const wss = new WebSocketServer({
   server,
   path: "/ws",
   verifyClient: (info, done) => {
     const token = queryParam(info.req, "token");
-    if (!token || !verifyToken(token)) {
+    const payload = token ? verifyToken(token) : null;
+    if (!payload) {
       done(false, 401, "missing or invalid token");
       return;
     }
-    const sessionId = queryParam(info.req, "session");
-    if (!sessionId) {
-      done(false, 400, "missing 'session' query param");
+    const roomId = queryParam(info.req, "room");
+    if (!roomId) {
+      done(false, 400, "missing 'room' query param");
       return;
     }
-    if (!getSession(sessionId)) {
-      done(false, 404, "unknown session");
+    const room = getRoom(roomId);
+    if (!room) {
+      done(false, 404, "unknown room");
+      return;
+    }
+    if (!isMember(roomId, payload.sub)) {
+      done(false, 403, "not a member of this room");
       return;
     }
     done(true);
@@ -56,20 +71,34 @@ const wss = new WebSocketServer({
 });
 
 wss.on("connection", (socket, req) => {
-  // verifyClient already guaranteed the session exists; re-resolve it here and
-  // bail gracefully on the rare chance it was deleted mid-handshake.
-  const sessionId = queryParam(req, "session");
-  const session = sessionId ? getSession(sessionId) : undefined;
-  if (!session) {
-    socket.close(1008, "session no longer exists");
+  // verifyClient already validated token, room, and membership; re-resolve here
+  // and bail gracefully on the rare chance the room was deleted mid-handshake.
+  const token = queryParam(req, "token");
+  const roomId = queryParam(req, "room");
+  const payload = token ? verifyToken(token) : null;
+  if (!roomId || !payload || !getRoom(roomId)) {
+    socket.close(1008, "room no longer exists");
+    return;
+  }
+  const user = findUserById(payload.sub);
+  if (!user) {
+    socket.close(1008, "account no longer exists");
     return;
   }
 
-  session.subscribers.add(socket);
-  socket.send(JSON.stringify({ type: "connected", sessionId: session.id }));
+  const conn: ClientConn = {
+    socket,
+    userId: user.id,
+    username: user.username,
+    avatarUrl: user.avatar_url,
+  };
+  addSubscriber(roomId, conn);
+  // Tell the newcomer the current watch state straight away (presence is
+  // broadcast to everyone by addSubscriber).
+  socket.send(JSON.stringify({ type: "watch", live: isLive(roomId) }));
 
   socket.on("close", () => {
-    session.subscribers.delete(socket);
+    removeSubscriber(roomId, conn);
   });
 });
 
@@ -101,8 +130,8 @@ async function shutdown(): Promise<void> {
   server.close();
   wss.close();
 
-  // Close every active watch session (also deregisters them).
-  await Promise.all(listSessions().map((s) => stopSession(s.id)));
+  // Close every active room watch (also removes any temp clones).
+  await stopAllRoomWatches();
 
   db.close();
   console.log("shutdown complete");

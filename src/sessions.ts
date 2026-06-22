@@ -271,7 +271,7 @@ async function handleEvent(
 export async function createWatchSession(
   rootPath: string,
   broadcast: BroadcastFn,
-  opts: { source?: string; cloneDir?: string } = {},
+  opts: { id?: string; source?: string; cloneDir?: string } = {},
 ): Promise<WatchSession> {
   const absRoot = path.resolve(rootPath);
   const watcher = chokidar.watch(absRoot, {
@@ -287,7 +287,7 @@ export async function createWatchSession(
   });
 
   const session: WatchSession = {
-    id: randomUUID(),
+    id: opts.id ?? randomUUID(),
     rootPath: absRoot,
     watcher,
     git: simpleGit(absRoot),
